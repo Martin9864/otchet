@@ -1,0 +1,115 @@
+name: otchet
+
+on:
+  workflow_dispatch:
+  pull_request:
+    branches: ["dev"]
+    types: [closed]
+    
+jobs:
+  build_and_notify:
+    if: github.event_name == 'workflow_dispatch' || github.event.pull_request.merged == true
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Install Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: "17"
+          distribution: "temurin"
+
+      - name: Build project and run tests
+        run: mvn clean verify
+
+      - name: Collect merge info
+        id: info
+        run: |
+          echo "SOURCE_BRANCH=${{ github.head_ref }}" >> $GITHUB_OUTPUT
+          echo "TARGET_BRANCH=${{ github.base_ref }}" >> $GITHUB_OUTPUT
+          echo "PR_URL=${{ github.event.pull_request.html_url }}" >> $GITHUB_OUTPUT
+          echo "PR_TITLE=${{ github.event.pull_request.title }}" >> $GITHUB_OUTPUT
+          echo "MERGED_AT=${{ github.event.pull_request.merged_at }}" >> $GITHUB_OUTPUT
+          echo "REPO_URL=https://github.com/${{ github.repository }}" >> $GITHUB_OUTPUT
+
+      - name: Get latest release tag
+        id: tag
+        run: |
+          git fetch --tags --force
+          TAG="$(git describe --tags --abbrev=0 2>/dev/null || echo "no-tag")"
+          echo "LATEST_TAG=$TAG" >> $GITHUB_OUTPUT
+
+      - name: Create pipeline report
+        if: always()
+        run: |
+          mkdir -p report
+          {
+            echo "GitHub Actions pipeline report"
+            echo "Repository: $GITHUB_REPOSITORY"
+            echo "Repo URL: ${{ steps.info.outputs.REPO_URL }}"
+            echo "Target branch: ${{ steps.info.outputs.TARGET_BRANCH }}"
+            echo "Source branch: ${{ steps.info.outputs.SOURCE_BRANCH }}"
+            echo "PR title: ${{ steps.info.outputs.PR_TITLE }}"
+            echo "PR URL: ${{ steps.info.outputs.PR_URL }}"
+            echo "Merged at (UTC): ${{ steps.info.outputs.MERGED_AT }}"
+            echo "Release tag: ${{ steps.tag.outputs.LATEST_TAG }}"
+            echo "Commit: $GITHUB_SHA"
+            echo "Status: ${{ job.status }}"
+          } > report/report.txt
+
+      - name: Upload report artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pipeline-report
+          path: report/report.txt
+
+      - name: Send message to Telegram
+        if: always()
+        continue-on-error: true
+        run: |
+          set -euo pipefail
+
+          PROJECT="${GITHUB_REPOSITORY}"
+          TAG="${{ steps.tag.outputs.LATEST_TAG }}"
+          if [ "$TAG" = "no-tag" ]; then TAG="не создавалась"; fi
+
+          DATE_UTC="${{ steps.info.outputs.MERGED_AT }}"
+          SOURCE_BRANCH="${{ steps.info.outputs.SOURCE_BRANCH }}"
+          TARGET_BRANCH="${{ steps.info.outputs.TARGET_BRANCH }}"
+
+          COMMIT_SHA="${GITHUB_SHA}"
+          COMMIT_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/${GITHUB_SHA}"
+
+          RUN_ID="${GITHUB_RUN_ID}"
+          RUN_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+
+          STATUS="${{ job.status }}"
+          PR_NUM="${{ github.event.pull_request.number }}"
+          PR_URL="${{ steps.info.outputs.PR_URL }}"
+
+          TEXT=$(printf "%s\n" \
+          "Новый выпуск изменений" \
+          "Проект: ${PROJECT}" \
+          "Версия (git tag): ${TAG}" \
+          "Дата: ${DATE_UTC} UTC" \
+          "" \
+          "Информация о репозитории" \
+          "Ветки: ${SOURCE_BRANCH} -> ${TARGET_BRANCH}" \
+          "Commit: ${COMMIT_SHA}" \
+          "${COMMIT_URL}" \
+          "" \
+          "Pipeline" \
+          "Run: ${RUN_ID}" \
+          "${RUN_URL}" \
+          "Статус: ${STATUS}" \
+          "PR: #${PR_NUM} (${PR_URL})" \
+          )
+
+          curl -s -X POST "https://api.telegram.org/bot${{ secrets.TELEGRAM_TOKEN }}/sendMessage" \
+            -d chat_id="${{ secrets.TELEGRAM_CHAT_ID }}" \
+            --data-urlencode text="$TEXT"
